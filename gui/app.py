@@ -85,7 +85,7 @@ class MainWindow(QMainWindow):
         # 画质 / FPS 设置
         self.fps_label = QLabel("FPS：")
         self.fps_spin = QSpinBox()
-        self.fps_spin.setRange(5, 60)
+        self.fps_spin.setRange(1, 60)
         self.fps_spin.setValue(25)
         self.quality_label = QLabel("画质：")
         self.quality_combo = QComboBox()
