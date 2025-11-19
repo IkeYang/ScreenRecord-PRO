@@ -18,6 +18,29 @@ def _timestamp_name() -> str:
     return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 
+def _parse_quality(value: str) -> float:
+    """Parse quality string into a spatial scale factor.
+
+    Accepts presets ("low", "medium", "high") or a float in (0, 1].
+    """
+
+    v = value.strip().lower()
+    presets = {
+        "low": 0.5,
+        "medium": 0.75,
+        "high": 1.0,
+    }
+    if v in presets:
+        return presets[v]
+    try:
+        f = float(v)
+    except ValueError as exc:  # pragma: no cover - CLI parse
+        raise SystemExit(f"Invalid quality value: {value!r}") from exc
+    if not (0.0 < f <= 1.0):
+        raise SystemExit("Quality scale must be in (0, 1].")
+    return f
+
+
 def list_screens() -> None:
     from .video import ScreenCapture
 
@@ -36,6 +59,8 @@ def run_record(
     outdir: str,
     duration: float | None,
     fps: int = 25,
+    quality_scale: float = 1.0,
+    fourcc: str = "XVID",
 ) -> tuple[str, str]:
     # Prepare paths
     _ensure_dir(outdir)
@@ -56,7 +81,7 @@ def run_record(
     )
 
     # Start recorders
-    cap = ScreenCapture(mon, video_path, fps=fps)
+    cap = ScreenCapture(mon, video_path, fps=fps, fourcc=fourcc, scale=quality_scale)
     ev = EventRecorder(geom)
 
     cap.start()
@@ -114,6 +139,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--outdir", type=str, default="output", help="Directory to save files")
     p.add_argument("--duration", type=float, default=None, help="Seconds to record (optional)")
     p.add_argument("--fps", type=int, default=25, help="Frames per second for video")
+    p.add_argument(
+        "--quality",
+        type=str,
+        default="high",
+        help="Recording quality: low/medium/high or a float scale in (0,1].",
+    )
 
     args = p.parse_args(argv)
     if args.list:
@@ -121,7 +152,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        run_record(args.screen, args.outdir, args.duration, fps=args.fps)
+        quality_scale = _parse_quality(args.quality)
+        run_record(
+            args.screen,
+            args.outdir,
+            args.duration,
+            fps=args.fps,
+            quality_scale=quality_scale,
+        )
     except KeyboardInterrupt:
         # Graceful exit already handled in run_record
         pass
