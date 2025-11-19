@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -31,7 +32,8 @@ from PySide6.QtWidgets import (
 
 from screenrec.events import EventRecorder, MonitorGeom
 from screenrec.video import ScreenCapture
-FPS=2
+from screenrec.replay import replay as replay_events
+
 
 def timestamp_name() -> str:
     return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -80,9 +82,31 @@ class MainWindow(QMainWindow):
         self.duration_label.setVisible(False)
         self.duration_spin.setVisible(False)
 
+        # 画质 / FPS 设置
+        self.fps_label = QLabel("FPS：")
+        self.fps_spin = QSpinBox()
+        self.fps_spin.setRange(5, 60)
+        self.fps_spin.setValue(25)
+        self.quality_label = QLabel("画质：")
+        self.quality_combo = QComboBox()
+        self.quality_combo.addItem("高（原始分辨率）", userData=1.0)
+        self.quality_combo.addItem("中（0.75x）", userData=0.75)
+        self.quality_combo.addItem("低（0.5x）", userData=0.5)
+
         self.status_label = QLabel("状态：空闲")
         self.toggle_btn = QPushButton("开始录制")
         self.toggle_btn.clicked.connect(self.on_toggle)
+
+        # 回放脚本区域
+        self.replay_path_edit = QLineEdit()
+        self.replay_browse_btn = QPushButton("选择 JSON…")
+        self.replay_browse_btn.clicked.connect(self.on_browse_replay)
+        self.replay_delay_label = QLabel("延迟回放（秒）：")
+        self.replay_delay_spin = QSpinBox()
+        self.replay_delay_spin.setRange(0, 3600)
+        self.replay_delay_spin.setValue(3)
+        self.replay_btn = QPushButton("开始回放")
+        self.replay_btn.clicked.connect(self.on_start_replay)
 
         form = QWidget()
         grid = QGridLayout()
@@ -111,6 +135,25 @@ class MainWindow(QMainWindow):
         dur_row.addWidget(self.duration_spin)
         grid.addLayout(dur_row, row, 0, 1, 2)
         row += 1
+        quality_row = QHBoxLayout()
+        quality_row.addWidget(self.fps_label)
+        quality_row.addWidget(self.fps_spin)
+        quality_row.addWidget(self.quality_label)
+        quality_row.addWidget(self.quality_combo)
+        grid.addLayout(quality_row, row, 0, 1, 2)
+        row += 1
+        replay_path_row = QHBoxLayout()
+        replay_path_row.addWidget(QLabel("回放脚本 JSON："))
+        replay_path_row.addWidget(self.replay_path_edit)
+        replay_path_row.addWidget(self.replay_browse_btn)
+        grid.addLayout(replay_path_row, row, 0, 1, 2)
+        row += 1
+        replay_ctrl_row = QHBoxLayout()
+        replay_ctrl_row.addWidget(self.replay_delay_label)
+        replay_ctrl_row.addWidget(self.replay_delay_spin)
+        replay_ctrl_row.addWidget(self.replay_btn)
+        grid.addLayout(replay_ctrl_row, row, 0, 1, 2)
+        row += 1
         grid.addWidget(self.status_label, row, 0, 1, 2)
         row += 1
         grid.addWidget(self.toggle_btn, row, 0, 1, 2)
@@ -129,17 +172,21 @@ class MainWindow(QMainWindow):
         self._json_path: Optional[str] = None
         self._geom: Optional[MonitorGeom] = None
         self._timer: Optional[QTimer] = None
+        self._fps: int = 25
+
+        self._replaying = False
+        self._replay_thread: Optional[threading.Thread] = None
 
         # 托盘图标
         self._setup_tray()
 
         # 热键控制器（固定组合）
-        self._hotkey_combo = "<ctrl>+<shift>+<f10>"
+        self._hotkey_combo = "ctrl+shift+f10"
         self._hotkey_listener = None
         self._hotkey_supported = self._check_hotkey_available()
         if not self._hotkey_supported:
             self.rb_hotkey.setEnabled(False)
-            self.hotkey_label.setText("热键：不可用（缺少 pynput）")
+            self.hotkey_label.setText("热键：不可用（缺少 keyboard 库）")
 
     def _load_monitors(self) -> list[Dict[str, int]]:
         try:
@@ -153,6 +200,17 @@ class MainWindow(QMainWindow):
         if directory:
             self.path_edit.setText(directory)
             self.settings.setValue("save_dir", directory)
+
+    def on_browse_replay(self) -> None:
+        start_dir = self.path_edit.text() or str(Path.home())
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择回放脚本 JSON",
+            start_dir,
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if path:
+            self.replay_path_edit.setText(path)
 
     def _selected_screen_index(self) -> int:
         data = self.screen_combo.currentData()
@@ -169,7 +227,61 @@ class MainWindow(QMainWindow):
             return False
         return True
 
+    # 回放
+    def on_start_replay(self) -> None:
+        if self._recording:
+            QMessageBox.warning(self, "无法回放", "录制进行中，无法开始回放。")
+            return
+        if self._replaying:
+            QMessageBox.information(self, "正在回放", "当前已有回放任务在进行中。")
+            return
+
+        path = self.replay_path_edit.text().strip()
+        if not path:
+            QMessageBox.warning(self, "无法回放", "请先选择要回放的 JSON 文件。")
+            return
+        if not os.path.isfile(path):
+            QMessageBox.warning(self, "无法回放", "指定的 JSON 文件不存在。")
+            return
+
+        delay_secs = int(self.replay_delay_spin.value())
+        self._replaying = True
+        self.replay_btn.setEnabled(False)
+        self.toggle_btn.setEnabled(False)
+        self.status_label.setText(
+            f"状态：将在 {delay_secs} 秒后开始回放（连续按两次 Esc 可中断）"
+        )
+
+        def _worker() -> None:
+            try:
+                replay_events(
+                    path,
+                    speed=1.0,
+                    dry_run=False,
+                    start_delay=float(delay_secs),
+                    allow_esc_stop=True,
+                )
+            except SystemExit:
+                # 依赖缺失等情况会通过 SystemExit 抛出，统一视为回放结束
+                pass
+            finally:
+                QTimer.singleShot(0, self._on_replay_finished)
+
+        self._replay_thread = threading.Thread(target=_worker, name="ReplayThread", daemon=True)
+        self._replay_thread.start()
+
+    def _on_replay_finished(self) -> None:
+        self._replaying = False
+        self._replay_thread = None
+        self.replay_btn.setEnabled(True)
+        self.toggle_btn.setEnabled(True)
+        if not self._recording:
+            self.status_label.setText("状态：空闲")
+
     def on_toggle(self) -> None:
+        if self._replaying:
+            QMessageBox.warning(self, "无法录制", "回放进行中，暂时无法开始录制。")
+            return
         if not self._recording:
             self.start_recording()
         else:
@@ -218,8 +330,12 @@ class MainWindow(QMainWindow):
         video_path = os.path.join(outdir, f"{base}.avi")
         json_path = os.path.join(outdir, f"{base}.json")
 
+        fps = int(self.fps_spin.value())
+        quality_scale = float(self.quality_combo.currentData() or 1.0)
+        self._fps = fps
+
         try:
-            video = ScreenCapture(mon, video_path, fps=FPS)
+            video = ScreenCapture(mon, video_path, fps=fps, scale=quality_scale)
             events = EventRecorder(geom)
             video.start()
             events.start()
@@ -267,7 +383,7 @@ class MainWindow(QMainWindow):
             data = {
                 "meta": {
                     "screen": asdict(self._geom),
-                    "fps": 25,
+                    "fps": int(self._fps or 25),
                     "started_at": os.path.basename(self._video_path)[:-4] if self._video_path else "",
                 },
                 "events": self._events.snapshot(),
@@ -350,27 +466,33 @@ class MainWindow(QMainWindow):
     # 热键
     def _check_hotkey_available(self) -> bool:
         try:
-            from pynput import keyboard as _kb  # noqa: F401
+            import keyboard  # type: ignore[import]
+            _ = keyboard.add_hotkey  # type: ignore[attr-defined]
             return True
         except Exception:
             return False
 
     def _enable_hotkey(self, enable: bool) -> None:
-        # Start/stop global hotkey listener for toggle
+        # Start/stop global hotkey listener for toggle using `keyboard` library
         if not self._hotkey_supported:
             return
         try:
-            from pynput import keyboard
+            import keyboard  # type: ignore[import]
         except Exception:
             return
         if enable and self._hotkey_listener is None:
-            def _cb():
-                # 由非GUI线程触发，使用singleShot切回主线程
+
+            def _cb() -> None:
+                # 由非 GUI 线程触发，使用 singleShot 切回主线程
                 QTimer.singleShot(0, self._on_hotkey_triggered)
-            self._hotkey_listener = keyboard.GlobalHotKeys({self._hotkey_combo: _cb})
-            self._hotkey_listener.start()
+
+            handle = keyboard.add_hotkey(self._hotkey_combo, _cb)
+            self._hotkey_listener = handle
         elif not enable and self._hotkey_listener is not None:
-            self._hotkey_listener.stop()
+            try:
+                keyboard.remove_hotkey(self._hotkey_listener)
+            except Exception:
+                pass
             self._hotkey_listener = None
 
     def _on_hotkey_triggered(self) -> None:
@@ -386,6 +508,9 @@ class MainWindow(QMainWindow):
             pass
         if self._recording:
             self.stop_recording()
+        if self._replaying:
+            # 回放线程为 daemon，直接退出应用即可
+            self._replaying = False
         super().closeEvent(event)
 
 
